@@ -15,7 +15,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Basit rate limit (dakikada 20 istek)
+// Rate limit (dakikada 20 istek)
 const requests = {};
 const WINDOW_MS = 60 * 1000;
 const MAX_PER_WINDOW = 20;
@@ -28,23 +28,81 @@ function rateLimit(req, res, next) {
     requests[ip] = [];
   }
 
-  // Eski istekleri temizle
   requests[ip] = requests[ip].filter((t) => now - t < WINDOW_MS);
 
   if (requests[ip].length >= MAX_PER_WINDOW) {
-    return res
-      .status(429)
-      .json({ error: "Too many requests, please try again later." });
+    return res.status(429).json({
+      error: "too_many_requests",
+      message: "Lütfen daha sonra tekrar deneyin.",
+    });
   }
 
   requests[ip].push(now);
   next();
 }
 
+//
+// 🚀 KULLANICI ÖNERİ HAK SİSTEMİ (Basit RAM tabanlı)
+// NOT: Sonraki adımda Firestore'a geçeceğiz.
+//
+const userCredits = {};
+const INITIAL_CREDITS = 7;
+
+function checkAndDecreaseCredits(userId) {
+  if (!userId) {
+    return { ok: false, code: "no_user", message: "userId eksik." };
+  }
+
+  // İlk kez geliyorsa başlangıç hakkı ver
+  if (!userCredits[userId]) {
+    userCredits[userId] = INITIAL_CREDITS;
+  }
+
+  // Kredi yoksa
+  if (userCredits[userId] <= 0) {
+    return {
+      ok: false,
+      code: "limit_exceeded",
+      message: "Ücretsiz araç önerisi hakkınız bitti.",
+    };
+  }
+
+  // Bir hak düş
+  userCredits[userId] -= 1;
+
+  return {
+    ok: true,
+    remaining: userCredits[userId],
+  };
+}
+
+//
+// 🚀 ARAÇ ÖNERİ ENDPOINTİ
+//
 app.post("/api/cars/recommend", rateLimit, async (req, res) => {
   try {
     const prefs = req.body;
+    const userId = prefs.userId; // Flutter'dan gelecek
 
+    // Kullanıcı öneri limitini kontrol et
+    const creditResult = checkAndDecreaseCredits(userId);
+
+    if (!creditResult.ok) {
+      const statusCode = creditResult.code === "limit_exceeded" ? 403 : 400;
+
+      return res.status(statusCode).json({
+        error: creditResult.code,
+        message: creditResult.message,
+      });
+    }
+
+    console.log(
+      `Kullanıcı ${userId} istekte bulundu. Kalan hak: ${creditResult.remaining}`
+    );
+
+    //
+    // 🚀 PROMPT (Senin özel promptun)
+    //
     const prompt = `
 Sen bir araç danışmanısın. Görevin, kullanıcının verdiği bilgilere göre Türkiye koşullarında ona uygun araç segmentini ve 3–5 adet model önerisini sunmaktır.
 
@@ -90,6 +148,9 @@ Dikkat:
 - JSON dışında TEK BİR KARAKTER bile yazma.
 `;
 
+    //
+    // 🚀 OPENAI API ÇAĞRISI
+    //
     const openaiRes = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -114,7 +175,7 @@ Dikkat:
     try {
       parsed = JSON.parse(content);
     } catch (e) {
-      console.error("JSON parse error, model cevabı:", content);
+      console.error("JSON parse error:", content);
       return res.status(500).json({ error: "Invalid JSON from OpenAI" });
     }
 
