@@ -158,11 +158,20 @@ Dikkat:
       }
     );
 
-    const content = openaiRes.data.choices[0].message.content;
+    // 🔍 OpenAI cevabını al, sadece JSON kısmını ayıkla
+    const content = openaiRes.data.choices[0].message.content.trim();
+
+    let jsonText = content;
+    const firstBracket = content.indexOf("[");
+    const lastBracket = content.lastIndexOf("]");
+
+    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+      jsonText = content.slice(firstBracket, lastBracket + 1);
+    }
 
     let parsed;
     try {
-      parsed = JSON.parse(content);
+      parsed = JSON.parse(jsonText);
     } catch (e) {
       console.error("JSON parse error:", content);
       return res.status(500).json({ error: "Invalid JSON from OpenAI" });
