@@ -85,24 +85,15 @@ app.post("/api/cars/recommend", rateLimit, async (req, res) => {
     const prefs = req.body;
     const userId = prefs.userId; // Flutter'dan gelen Firebase uid
 
-    // Kullanıcı öneri limitini kontrol et
-    const creditResult = checkAndDecreaseCredits(userId);
-
-    if (!creditResult.ok) {
-      const statusCode = creditResult.code === "limit_exceeded" ? 403 : 400;
-
-      return res.status(statusCode).json({
-        error: creditResult.code,
-        message: creditResult.message,
+    if (!userId) {
+      return res.status(400).json({
+        error: "no_user",
+        message: "userId eksik.",
       });
     }
 
-    console.log(
-      `Kullanıcı ${userId} istekte bulundu. Kalan hak: ${creditResult.remaining}`
-    );
-
     //
-    // 🚀 PROMPT (Senin özel promptun)
+    // 1️⃣ ÖNCE OPENAI'DEN SAĞLIKLI CEVAP AL
     //
     const prompt = `
 Sen bir araç danışmanısın. Görevin, kullanıcının verdiği bilgilere göre Türkiye koşullarında ona uygun araç segmentini ve 3–5 adet model önerisini sunmaktır.
@@ -149,9 +140,6 @@ Dikkat:
 - JSON dışında TEK BİR KARAKTER bile yazma.
 `;
 
-    //
-    // 🚀 OPENAI API ÇAĞRISI
-    //
     const openaiRes = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -180,6 +168,27 @@ Dikkat:
       return res.status(500).json({ error: "Invalid JSON from OpenAI" });
     }
 
+    //
+    // 2️⃣ CEVAP BAŞARILIYSA ŞİMDİ KREDİ DÜŞ
+    //
+    const creditResult = checkAndDecreaseCredits(userId);
+
+    if (!creditResult.ok) {
+      const statusCode = creditResult.code === "limit_exceeded" ? 403 : 400;
+
+      return res.status(statusCode).json({
+        error: creditResult.code,
+        message: creditResult.message,
+      });
+    }
+
+    console.log(
+      `Kullanıcı ${userId} istekte bulundu. Kalan hak: ${creditResult.remaining}`
+    );
+
+    //
+    // 3️⃣ SON OLARAK ÖNERİLERİ GÖNDER
+    //
     res.json(parsed);
   } catch (err) {
     console.error(err.response?.data || err.message);
