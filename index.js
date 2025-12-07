@@ -15,7 +15,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Rate limit (dakikada 20 istek)
+// Rate limit (dakikada 20 istek - IP bazlı)
 const requests = {};
 const WINDOW_MS = 60 * 1000;
 const MAX_PER_WINDOW = 20;
@@ -28,6 +28,7 @@ function rateLimit(req, res, next) {
     requests[ip] = [];
   }
 
+  // Eski istekleri temizle
   requests[ip] = requests[ip].filter((t) => now - t < WINDOW_MS);
 
   if (requests[ip].length >= MAX_PER_WINDOW) {
@@ -43,18 +44,18 @@ function rateLimit(req, res, next) {
 
 //
 // 🚀 KULLANICI ÖNERİ HAK SİSTEMİ (Basit RAM tabanlı)
-// NOT: Sonraki adımda Firestore'a geçeceğiz.
+// Sonraki adımda veritabanına (Firestore vs.) taşınabilir.
 //
 const userCredits = {};
-const INITIAL_CREDITS = 7;
+const INITIAL_CREDITS = 7; // 🔥 Şu anki limitin (istersen kolayca değiştirirsin)
 
 function checkAndDecreaseCredits(userId) {
   if (!userId) {
     return { ok: false, code: "no_user", message: "userId eksik." };
   }
 
-  // İlk kez geliyorsa başlangıç hakkı ver
-  if (!userCredits[userId]) {
+  // ❗ Sadece daha önce hiç görülmeyen kullanıcıya başlangıç hakkı ver
+  if (userCredits[userId] === undefined) {
     userCredits[userId] = INITIAL_CREDITS;
   }
 
@@ -82,7 +83,7 @@ function checkAndDecreaseCredits(userId) {
 app.post("/api/cars/recommend", rateLimit, async (req, res) => {
   try {
     const prefs = req.body;
-    const userId = prefs.userId; // Flutter'dan gelecek
+    const userId = prefs.userId; // Flutter'dan gelen Firebase uid
 
     // Kullanıcı öneri limitini kontrol et
     const creditResult = checkAndDecreaseCredits(userId);
