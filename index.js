@@ -165,7 +165,11 @@ Dikkat:
     const firstBracket = content.indexOf("[");
     const lastBracket = content.lastIndexOf("]");
 
-    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    if (
+      firstBracket !== -1 &&
+      lastBracket !== -1 &&
+      lastBracket > firstBracket
+    ) {
       jsonText = content.slice(firstBracket, lastBracket + 1);
     }
 
@@ -203,6 +207,35 @@ Dikkat:
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: "Server error" });
   }
+});
+
+//
+// 🚀 SATIN ALIM SONRASI KREDİ EKLEME ENDPOINTİ
+//
+app.post("/api/cars/add-credits", (req, res) => {
+  const { userId, amount } = req.body;
+
+  if (!userId || !amount || typeof amount !== "number") {
+    return res.status(400).json({
+      error: "invalid_params",
+      message: "userId veya amount eksik/hatalı.",
+    });
+  }
+
+  if (userCredits[userId] === undefined) {
+    userCredits[userId] = 0;
+  }
+
+  userCredits[userId] += amount;
+
+  console.log(
+    `Kullanıcı ${userId} için ${amount} kredi eklendi. Yeni toplam: ${userCredits[userId]}`
+  );
+
+  return res.json({
+    ok: true,
+    total: userCredits[userId],
+  });
 });
 
 const port = process.env.PORT || 3000;
