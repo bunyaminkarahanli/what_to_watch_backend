@@ -1,244 +1,72 @@
-// index.js
-const express = require("express");
-const cors = require("cors");
-const dotenv = require("dotenv");
-const axios = require("axios");
-
-dotenv.config();
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// Basit health check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-// Rate limit (dakikada 20 istek - IP bazlı)
-const requests = {};
-const WINDOW_MS = 60 * 1000;
-const MAX_PER_WINDOW = 20;
-
-function rateLimit(req, res, next) {
-  const ip = req.ip;
-  const now = Date.now();
-
-  if (!requests[ip]) {
-    requests[ip] = [];
-  }
-
-  // Eski istekleri temizle
-  requests[ip] = requests[ip].filter((t) => now - t < WINDOW_MS);
-
-  if (requests[ip].length >= MAX_PER_WINDOW) {
-    return res.status(429).json({
-      error: "too_many_requests",
-      message: "Lütfen daha sonra tekrar deneyin.",
-    });
-  }
-
-  requests[ip].push(now);
-  next();
-}
-
-//
-// 🚀 KULLANICI ÖNERİ HAK SİSTEMİ (Basit RAM tabanlı)
-// Sonraki adımda veritabanına (Firestore vs.) taşınabilir.
-//
-const userCredits = {};
-const INITIAL_CREDITS = 7; // 🔥 Şu anki limitin (istersen kolayca değiştirirsin)
-
-function checkAndDecreaseCredits(userId) {
-  if (!userId) {
-    return { ok: false, code: "no_user", message: "userId eksik." };
-  }
-
-  // ❗ Sadece daha önce hiç görülmeyen kullanıcıya başlangıç hakkı ver
-  if (userCredits[userId] === undefined) {
-    userCredits[userId] = INITIAL_CREDITS;
-  }
-
-  // Kredi yoksa
-  if (userCredits[userId] <= 0) {
-    return {
-      ok: false,
-      code: "limit_exceeded",
-      message: "Ücretsiz araç önerisi hakkınız bitti.",
-    };
-  }
-
-  // Bir hak düş
-  userCredits[userId] -= 1;
-
-  return {
-    ok: true,
-    remaining: userCredits[userId],
-  };
-}
-
-//
-// 🚀 ARAÇ ÖNERİ ENDPOINTİ
-//
-app.post("/api/cars/recommend", rateLimit, async (req, res) => {
-  try {
-    const prefs = req.body;
-    const userId = prefs.userId; // Flutter'dan gelen Firebase uid
-
-    if (!userId) {
-      return res.status(400).json({
-        error: "no_user",
-        message: "userId eksik.",
-      });
-    }
-
-    //
-    // 1️⃣ ÖNCE OPENAI'DEN SAĞLIKLI CEVAP AL
-    //
-    const prompt = `
-Sen bir araç danışmanısın. Görevin, kullanıcının verdiği bilgilere göre Türkiye koşullarında ona uygun araç segmentini ve 3–5 adet model önerisini sunmaktır.
-
-Kurallar:
-- Türkiye’deki güncel fiyatları bilmiyorsun. Kesinlikle FİYAT bilgisi, TL, bütçe, fiyat aralığı yazma.
-- “Şu kadar TL’ye alırsın”, “bu fiyat bandında” gibi ifadeler kullanma.
-- Sadece genel tavsiye ver: segment, araç/kasa tipi, yakıt tipi, vites tipi, uygun kullanım senaryosu vb.
-- Önerdiğin her araç için kısa ama açıklayıcı bir açıklama yaz: kime uygun, artıları neler, neden öneriyorsun.
-- Kullanıcının ek notlarını da mutlaka dikkate al.
-- Cevabı mutlaka GEÇERLİ BİR JSON olarak döndür.
-- JSON dışında hiçbir açıklama, yorum, metin yazma. Sadece JSON üret.
-
-Kullanıcının cevapları şunlardır:
-
-- Kullanım alanı: ${prefs.usage}
-- Aile büyüklüğü: ${prefs.family_size}
-- Sürüş tecrübesi: ${prefs.driving_experience}
-- Yakıt tercihi: ${prefs.fuel_type}
-- Vites tercihi: ${prefs.gearbox}
-- Araç tipi: ${prefs.body_type}
-- Sıfır / ikinci el tercihi: ${prefs.new_or_used}
-- Önceliği: ${prefs.priority}
-- Teknoloji/donanım beklentisi: ${prefs.tech_level}
-- Ek not: ${prefs.extra_desc || ""}
-
-Bu bilgilere göre bana SADECE şu formatta bir JSON DİZİSİ döndür:
-
-[
-  {
-    "model": "Model adı",
-    "why": "Bu modelin neden uygun olduğu, artıları, kime hitap ettiği (kısa açıklama)",
-    "segment": "Önerilen segment (örneğin C-SUV, B-Hatchback vb.)"
-  },
-  {
-    "model": "Diğer model",
-    "why": "Açıklama",
-    "segment": "Segment"
-  }
-]
-
-Dikkat:
-- "price", "fiyat", "TL" gibi kelimeleri kullanma.
-- JSON dışında TEK BİR KARAKTER bile yazma.
-`;
-
-    const openaiRes = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "You are a car recommendation AI." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.2,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    // 🔍 OpenAI cevabını al, sadece JSON kısmını ayıkla
-    const content = openaiRes.data.choices[0].message.content.trim();
-
-    let jsonText = content;
-    const firstBracket = content.indexOf("[");
-    const lastBracket = content.lastIndexOf("]");
-
-    if (
-      firstBracket !== -1 &&
-      lastBracket !== -1 &&
-      lastBracket > firstBracket
-    ) {
-      jsonText = content.slice(firstBracket, lastBracket + 1);
-    }
-
-    let parsed;
+// 🚀 ARAÇ ÖNERİ ENDPOINTİ (TOKEN ZORUNLU)
+app.post(
+  "/api/cars/recommend",
+  rateLimit,
+  requireFirebaseAuth,
+  async (req, res) => {
     try {
-      parsed = JSON.parse(jsonText);
-    } catch (e) {
-      console.error("JSON parse error:", content);
-      return res.status(500).json({ error: "Invalid JSON from OpenAI" });
+      const prefs = req.body;
+      const userId = req.user.uid; // ✅ TOKEN'DAN
+
+      // ✅ Önce kredi düş (OpenAI çağrısından önce)
+      const creditResult = decreaseCredit(userId);
+      if (!creditResult.ok) {
+        return res.status(403).json({
+          error: creditResult.code,
+          message: creditResult.message,
+        });
+      }
+
+      const prompt = `
+Sen bir araç danışmanısın...
+( BURASI AYNI – DOKUNMA )
+      `;
+
+      const openaiRes = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4.1-mini",
+          messages: [
+            { role: "system", content: "You are a car recommendation AI." },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.2,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const content = openaiRes.data.choices[0].message.content.trim();
+
+      let jsonText = content;
+      const firstBracket = content.indexOf("[");
+      const lastBracket = content.lastIndexOf("]");
+
+      if (firstBracket !== -1 && lastBracket !== -1) {
+        jsonText = content.slice(firstBracket, lastBracket + 1);
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch (e) {
+        // ❗ JSON bozulursa krediyi geri ver
+        addCredits(userId, 1);
+        return res.status(500).json({ error: "Invalid JSON from OpenAI" });
+      }
+
+      console.log(
+        `Kullanıcı ${userId} öneri aldı. Kalan hak: ${creditResult.remaining}`
+      );
+
+      res.json(parsed);
+    } catch (err) {
+      console.error(err.response?.data || err.message);
+      res.status(500).json({ error: "Server error" });
     }
-
-    //
-    // 2️⃣ CEVAP BAŞARILIYSA ŞİMDİ KREDİ DÜŞ
-    //
-    const creditResult = checkAndDecreaseCredits(userId);
-
-    if (!creditResult.ok) {
-      const statusCode = creditResult.code === "limit_exceeded" ? 403 : 400;
-
-      return res.status(statusCode).json({
-        error: creditResult.code,
-        message: creditResult.message,
-      });
-    }
-
-    console.log(
-      `Kullanıcı ${userId} istekte bulundu. Kalan hak: ${creditResult.remaining}`
-    );
-
-    //
-    // 3️⃣ SON OLARAK ÖNERİLERİ GÖNDER
-    //
-    res.json(parsed);
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "Server error" });
   }
-});
-
-//
-// 🚀 SATIN ALIM SONRASI KREDİ EKLEME ENDPOINTİ
-//
-app.post("/api/cars/add-credits", (req, res) => {
-  const { userId, amount } = req.body;
-
-  if (!userId || !amount || typeof amount !== "number") {
-    return res.status(400).json({
-      error: "invalid_params",
-      message: "userId veya amount eksik/hatalı.",
-    });
-  }
-
-  if (userCredits[userId] === undefined) {
-    userCredits[userId] = 0;
-  }
-
-  userCredits[userId] += amount;
-
-  console.log(
-    `Kullanıcı ${userId} için ${amount} kredi eklendi. Yeni toplam: ${userCredits[userId]}`
-  );
-
-  return res.json({
-    ok: true,
-    total: userCredits[userId],
-  });
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, () =>
-  console.log(`Backend çalıştı: http://localhost:${port}`)
 );
