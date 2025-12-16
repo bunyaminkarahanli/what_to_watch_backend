@@ -7,7 +7,7 @@ const admin = require("firebase-admin");
 
 dotenv.config();
 
-// ✅ app TANIMI (sende burada eksik olduğu için crash alıyorsun)
+// ✅ app TANIMI
 const app = express();
 app.use(cors());
 app.use(express.json());
