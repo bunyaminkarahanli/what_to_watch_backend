@@ -283,7 +283,7 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, (req, res) => {
       });
     }
 
-    const amountToAdd = productId === "credits_10" ? 10 : 0;
+    const amountToAdd = productId === "credits-10" ? 10 : 0;
     if (amountToAdd <= 0) {
       return res.status(400).json({
         error: "unknown_product",
