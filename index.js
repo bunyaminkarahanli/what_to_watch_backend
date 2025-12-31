@@ -20,9 +20,7 @@ function initFirebaseAdmin() {
   const json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   if (!json) {
-    console.warn(
-      "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON yok. Token doğrulama çalışmaz."
-    );
+    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON yok. Token doğrulama çalışmaz.");
     return;
   }
 
@@ -36,14 +34,14 @@ function initFirebaseAdmin() {
       console.log("✅ Firebase Admin initialized (env)");
     }
   } catch (e) {
-    console.error(
-      "❌ FIREBASE_SERVICE_ACCOUNT_JSON parse edilemedi:",
-      e.message
-    );
+    console.error("❌ FIREBASE_SERVICE_ACCOUNT_JSON parse edilemedi:", e.message);
   }
 }
 
 initFirebaseAdmin();
+
+// ✅ Firestore handle
+const db = admin.apps.length ? admin.firestore() : null;
 
 // -----------------------------
 // Health check
@@ -114,62 +112,115 @@ async function requireFirebaseAuth(req, res, next) {
 }
 
 // -----------------------------
-// 🚀 Kredi sistemi (RAM tabanlı)
+// ✅ Firestore tabanlı kredi sistemi
+// users/{uid} -> { credits: number, createdAt, updatedAt }
+// purchases/{purchaseToken} -> { userId, amount, createdAt, meta }
 // -----------------------------
-const userCredits = {};
 const INITIAL_CREDITS = 7;
 
-// ✅ Idempotency: aynı purchaseToken tekrar gelirse kredi ekleme
-const processedPurchases = {}; // purchaseToken -> { userId, amount, createdAt, meta }
-
-function ensureUserCredits(userId) {
-  if (userCredits[userId] === undefined) userCredits[userId] = INITIAL_CREDITS;
-  return userCredits[userId];
+function requireFirestore(req, res) {
+  if (!db) {
+    res.status(500).json({
+      error: "firestore_not_initialized",
+      message: "Firestore başlatılamadı. Firebase Admin init / env kontrol et.",
+    });
+    return false;
+  }
+  return true;
 }
 
-function decreaseCredit(userId) {
-  ensureUserCredits(userId);
+async function getOrCreateUserCredits(userId) {
+  const ref = db.collection("users").doc(userId);
+  const snap = await ref.get();
 
-  if (userCredits[userId] <= 0) {
-    return {
-      ok: false,
-      code: "limit_exceeded",
-      message: "Ücretsiz araç önerisi hakkınız bitti.",
-    };
+  if (!snap.exists) {
+    await ref.set({
+      credits: INITIAL_CREDITS,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return INITIAL_CREDITS;
   }
 
-  userCredits[userId] -= 1;
-  return { ok: true, remaining: userCredits[userId] };
+  const data = snap.data() || {};
+  const credits = typeof data.credits === "number" ? data.credits : 0;
+  return credits;
 }
 
-function addCredits(userId, amount) {
-  if (userCredits[userId] === undefined) userCredits[userId] = 0;
-  userCredits[userId] += amount;
-  return userCredits[userId];
+async function decreaseCredit(userId) {
+  const ref = db.collection("users").doc(userId);
+
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+
+    // kullanıcı yoksa oluştur ve 1 düş
+    if (!snap.exists) {
+      tx.set(ref, {
+        credits: INITIAL_CREDITS - 1,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { ok: true, remaining: INITIAL_CREDITS - 1 };
+    }
+
+    const data = snap.data() || {};
+    const credits = typeof data.credits === "number" ? data.credits : 0;
+
+    if (credits <= 0) {
+      return {
+        ok: false,
+        code: "limit_exceeded",
+        message: "Ücretsiz araç önerisi hakkınız bitti.",
+      };
+    }
+
+    tx.update(ref, {
+      credits: credits - 1,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { ok: true, remaining: credits - 1 };
+  });
+}
+
+async function addCredits(userId, amount) {
+  const ref = db.collection("users").doc(userId);
+
+  // kullanıcı yoksa bile merge ile oluşturur
+  await ref.set(
+    {
+      credits: admin.firestore.FieldValue.increment(amount),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  const snap = await ref.get();
+  const data = snap.data() || {};
+  return typeof data.credits === "number" ? data.credits : 0;
 }
 
 // -----------------------------
 // 🚀 ARAÇ ÖNERİ ENDPOINTİ (TOKEN ZORUNLU)
 // -----------------------------
-app.post(
-  "/api/cars/recommend",
-  rateLimit,
-  requireFirebaseAuth,
-  async (req, res) => {
-    try {
-      const prefs = req.body || {};
-      const userId = req.user.uid; // ✅ TOKEN'DAN
+app.post("/api/cars/recommend", rateLimit, requireFirebaseAuth, async (req, res) => {
+  try {
+    if (!requireFirestore(req, res)) return;
 
-      // ✅ önce kredi düş (OpenAI çağrısından önce)
-      const creditResult = decreaseCredit(userId);
-      if (!creditResult.ok) {
-        return res.status(403).json({
-          error: creditResult.code,
-          message: creditResult.message,
-        });
-      }
+    const prefs = req.body || {};
+    const userId = req.user.uid;
 
-      const prompt = `
+    // ✅ önce kredi düş (OpenAI çağrısından önce)
+    const creditResult = await decreaseCredit(userId);
+    if (!creditResult.ok) {
+      return res.status(403).json({
+        error: creditResult.code,
+        message: creditResult.message,
+      });
+    }
+
+    const prompt = `
 Sen bir araç danışmanısın. Görevin, kullanıcının verdiği bilgilere göre Türkiye koşullarında ona uygun araç segmentini ve 3–5 adet model önerisini sunmaktır.
 
 Kurallar:
@@ -208,64 +259,57 @@ Dikkat:
 - JSON dışında TEK BİR KARAKTER bile yazma.
 `;
 
-      const openaiRes = await axios.post(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          model: "gpt-4.1-mini",
-          messages: [
-            { role: "system", content: "You are a car recommendation AI." },
-            { role: "user", content: prompt },
-          ],
-          temperature: 0.2,
+    const openaiRes = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: "You are a car recommendation AI." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.2,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
         },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-        }
-      );
-
-      const content = (
-        openaiRes.data.choices?.[0]?.message?.content || ""
-      ).trim();
-
-      let jsonText = content;
-      const firstBracket = content.indexOf("[");
-      const lastBracket = content.lastIndexOf("]");
-      if (
-        firstBracket !== -1 &&
-        lastBracket !== -1 &&
-        lastBracket > firstBracket
-      ) {
-        jsonText = content.slice(firstBracket, lastBracket + 1);
       }
+    );
 
-      let parsed;
-      try {
-        parsed = JSON.parse(jsonText);
-      } catch (e) {
-        // JSON bozulursa krediyi geri ver
-        addCredits(userId, 1);
-        return res.status(500).json({ error: "Invalid JSON from OpenAI" });
-      }
+    const content = (openaiRes.data.choices?.[0]?.message?.content || "").trim();
 
-      console.log(
-        `✅ user=${userId} öneri aldı. kalan=${creditResult.remaining}`
-      );
-      return res.json(parsed);
-    } catch (err) {
-      console.error(err.response?.data || err.message);
-      return res.status(500).json({ error: "Server error" });
+    let jsonText = content;
+    const firstBracket = content.indexOf("[");
+    const lastBracket = content.lastIndexOf("]");
+    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+      jsonText = content.slice(firstBracket, lastBracket + 1);
     }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch (e) {
+      // JSON bozulursa krediyi geri ver
+      await addCredits(userId, 1);
+      return res.status(500).json({ error: "Invalid JSON from OpenAI" });
+    }
+
+    console.log(`✅ user=${userId} öneri aldı. kalan=${creditResult.remaining}`);
+    return res.json(parsed);
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    return res.status(500).json({ error: "Server error" });
   }
-);
+});
 
 // -----------------------------
-// 🚀 SATIN ALIM SONRASI KREDİ EKLEME (IDEMPOTENT)
+// 🚀 SATIN ALIM SONRASI KREDİ EKLEME (IDEMPOTENT - Firestore)
 // -----------------------------
-app.post("/api/cars/add-credits", requireFirebaseAuth, (req, res) => {
+app.post("/api/cars/add-credits", requireFirebaseAuth, async (req, res) => {
   try {
+    if (!requireFirestore(req, res)) return;
+
     const userId = req.user?.uid;
     const { platform, packageName, productId, purchaseToken } = req.body || {};
 
@@ -291,28 +335,59 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, (req, res) => {
       });
     }
 
-    // ✅ IDMPOTENCY
-    if (processedPurchases[purchaseToken]) {
-      const total = userCredits[userId] ?? 0;
-      return res.json({
-        ok: true,
-        alreadyProcessed: true,
-        total,
-        message: "Bu satın alım daha önce işlendi. Tekrar kredi eklenmedi.",
+    // ✅ idempotency: purchaseToken ile tekil
+    const purchaseRef = db.collection("purchases").doc(purchaseToken);
+
+    const result = await db.runTransaction(async (tx) => {
+      const purchaseSnap = await tx.get(purchaseRef);
+
+      if (purchaseSnap.exists) {
+        // daha önce işlenmiş
+        const credits = await getOrCreateUserCredits(userId);
+        return { ok: true, alreadyProcessed: true, total: credits };
+      }
+
+      // satın alımı kaydet
+      tx.set(purchaseRef, {
+        userId,
+        amount: amountToAdd,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        meta: { platform, packageName, productId },
       });
-    }
 
-    processedPurchases[purchaseToken] = {
-      userId,
-      amount: amountToAdd,
-      createdAt: Date.now(),
-      meta: { platform, packageName, productId },
-    };
+      // krediyi ekle
+      const userRef = db.collection("users").doc(userId);
+      const userSnap = await tx.get(userRef);
 
-    const total = addCredits(userId, amountToAdd);
+      if (!userSnap.exists) {
+        tx.set(userRef, {
+          credits: INITIAL_CREDITS + amountToAdd,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { ok: true, alreadyProcessed: false, total: INITIAL_CREDITS + amountToAdd };
+      }
 
-    console.log(`✅ add-credits user=${userId} +${amountToAdd} total=${total}`);
-    return res.json({ ok: true, alreadyProcessed: false, total });
+      const current = (userSnap.data()?.credits ?? 0);
+      const newTotal = current + amountToAdd;
+
+      tx.update(userRef, {
+        credits: newTotal,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return { ok: true, alreadyProcessed: false, total: newTotal };
+    });
+
+    console.log(`✅ add-credits user=${userId} +${amountToAdd} total=${result.total}`);
+    return res.json({
+      ok: true,
+      alreadyProcessed: result.alreadyProcessed,
+      total: result.total,
+      message: result.alreadyProcessed
+        ? "Bu satın alım daha önce işlendi. Tekrar kredi eklenmedi."
+        : "Kredi eklendi.",
+    });
   } catch (e) {
     console.error("add-credits error:", e);
     return res.status(500).json({
@@ -324,6 +399,4 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, (req, res) => {
 
 // -----------------------------
 const port = process.env.PORT || 3000;
-app.listen(port, () =>
-  console.log(`Backend çalıştı: http://localhost:${port}`)
-);
+app.listen(port, () => console.log(`Backend çalıştı: http://localhost:${port}`));
