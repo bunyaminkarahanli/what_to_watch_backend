@@ -7,7 +7,7 @@ const admin = require("firebase-admin");
 
 dotenv.config();
 
-// ✅ app TANIMI
+// ✅ app
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -20,7 +20,9 @@ function initFirebaseAdmin() {
   const json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   if (!json) {
-    console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON yok. Token doğrulama çalışmaz.");
+    console.warn(
+      "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON yok. Token doğrulama çalışmaz."
+    );
     return;
   }
 
@@ -34,10 +36,12 @@ function initFirebaseAdmin() {
       console.log("✅ Firebase Admin initialized (env)");
     }
   } catch (e) {
-    console.error("❌ FIREBASE_SERVICE_ACCOUNT_JSON parse edilemedi:", e.message);
+    console.error(
+      "❌ FIREBASE_SERVICE_ACCOUNT_JSON parse edilemedi:",
+      e.message
+    );
   }
 }
-
 initFirebaseAdmin();
 
 // ✅ Firestore handle
@@ -129,24 +133,6 @@ function requireFirestore(req, res) {
   return true;
 }
 
-async function getOrCreateUserCredits(userId) {
-  const ref = db.collection("users").doc(userId);
-  const snap = await ref.get();
-
-  if (!snap.exists) {
-    await ref.set({
-      credits: INITIAL_CREDITS,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return INITIAL_CREDITS;
-  }
-
-  const data = snap.data() || {};
-  const credits = typeof data.credits === "number" ? data.credits : 0;
-  return credits;
-}
-
 async function decreaseCredit(userId) {
   const ref = db.collection("users").doc(userId);
 
@@ -186,7 +172,6 @@ async function decreaseCredit(userId) {
 async function addCredits(userId, amount) {
   const ref = db.collection("users").doc(userId);
 
-  // kullanıcı yoksa bile merge ile oluşturur
   await ref.set(
     {
       credits: admin.firestore.FieldValue.increment(amount),
@@ -203,24 +188,45 @@ async function addCredits(userId, amount) {
 
 // -----------------------------
 // 🚀 ARAÇ ÖNERİ ENDPOINTİ (TOKEN ZORUNLU)
+// ✅ ÖNEMLİ: Backend/OpenAI/JSON hatasında kredi geri eklenir
 // -----------------------------
-app.post("/api/cars/recommend", rateLimit, requireFirebaseAuth, async (req, res) => {
-  try {
+app.post(
+  "/api/cars/recommend",
+  rateLimit,
+  requireFirebaseAuth,
+  async (req, res) => {
     if (!requireFirestore(req, res)) return;
 
     const prefs = req.body || {};
     const userId = req.user.uid;
 
-    // ✅ önce kredi düş (OpenAI çağrısından önce)
-    const creditResult = await decreaseCredit(userId);
-    if (!creditResult.ok) {
-      return res.status(403).json({
-        error: creditResult.code,
-        message: creditResult.message,
-      });
+    let creditDeducted = false;
+    let refunded = false;
+
+    async function refundOnce() {
+      if (!creditDeducted) return;
+      if (refunded) return;
+      refunded = true;
+      try {
+        await addCredits(userId, 1);
+        console.log(`↩️ credit refunded user=${userId} (+1)`);
+      } catch (e) {
+        console.error("❌ refund failed:", e.message || e);
+      }
     }
 
-    const prompt = `
+    try {
+      // ✅ önce kredi düş (race condition önler)
+      const creditResult = await decreaseCredit(userId);
+      if (!creditResult.ok) {
+        return res.status(403).json({
+          error: creditResult.code,
+          message: creditResult.message,
+        });
+      }
+      creditDeducted = true;
+
+      const prompt = `
 Sen bir araç danışmanısın. Görevin, kullanıcının verdiği bilgilere göre Türkiye koşullarında ona uygun araç segmentini ve 3–5 adet model önerisini sunmaktır.
 
 Kurallar:
@@ -259,49 +265,72 @@ Dikkat:
 - JSON dışında TEK BİR KARAKTER bile yazma.
 `;
 
-    const openaiRes = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: "You are a car recommendation AI." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.2,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
+      const openaiRes = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4.1-mini",
+          messages: [
+            { role: "system", content: "You are a car recommendation AI." },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.2,
         },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 45000,
+        }
+      );
+
+      const content = (
+        openaiRes.data.choices?.[0]?.message?.content || ""
+      ).trim();
+
+      let jsonText = content;
+      const firstBracket = content.indexOf("[");
+      const lastBracket = content.lastIndexOf("]");
+      if (
+        firstBracket !== -1 &&
+        lastBracket !== -1 &&
+        lastBracket > firstBracket
+      ) {
+        jsonText = content.slice(firstBracket, lastBracket + 1);
       }
-    );
 
-    const content = (openaiRes.data.choices?.[0]?.message?.content || "").trim();
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch (e) {
+        // ✅ JSON bozuldu → kredi geri ver
+        await refundOnce();
+        return res.status(500).json({
+          error: "invalid_json",
+          message: "Yanıt işlenemedi. Lütfen tekrar deneyin.",
+        });
+      }
 
-    let jsonText = content;
-    const firstBracket = content.indexOf("[");
-    const lastBracket = content.lastIndexOf("]");
-    if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
-      jsonText = content.slice(firstBracket, lastBracket + 1);
+      console.log(
+        `✅ user=${userId} öneri aldı. kalan=${creditResult.remaining}`
+      );
+      return res.json(parsed);
+    } catch (err) {
+      // ✅ OpenAI / network / server error → kredi geri ver
+      await refundOnce();
+
+      console.error(
+        "❌ /api/cars/recommend error:",
+        err.response?.data || err.message || err
+      );
+
+      return res.status(500).json({
+        error: "server_error",
+        message: "Lütfen tekrardan deneyiniz.",
+      });
     }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonText);
-    } catch (e) {
-      // JSON bozulursa krediyi geri ver
-      await addCredits(userId, 1);
-      return res.status(500).json({ error: "Invalid JSON from OpenAI" });
-    }
-
-    console.log(`✅ user=${userId} öneri aldı. kalan=${creditResult.remaining}`);
-    return res.json(parsed);
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    return res.status(500).json({ error: "Server error" });
   }
-});
+);
 
 // -----------------------------
 // 🚀 SATIN ALIM SONRASI KREDİ EKLEME (IDEMPOTENT - Firestore)
@@ -335,19 +364,39 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, async (req, res) => {
       });
     }
 
-    // ✅ idempotency: purchaseToken ile tekil
+    const userRef = db.collection("users").doc(userId);
     const purchaseRef = db.collection("purchases").doc(purchaseToken);
 
     const result = await db.runTransaction(async (tx) => {
       const purchaseSnap = await tx.get(purchaseRef);
 
-      if (purchaseSnap.exists) {
-        // daha önce işlenmiş
-        const credits = await getOrCreateUserCredits(userId);
-        return { ok: true, alreadyProcessed: true, total: credits };
+      // Kullanıcı docunu da tx içinde oku
+      const userSnap = await tx.get(userRef);
+
+      // Kullanıcı yoksa tx içinde oluştur (en azından başlangıç)
+      let currentCredits = 0;
+      if (!userSnap.exists) {
+        currentCredits = INITIAL_CREDITS;
+        tx.set(userRef, {
+          credits: INITIAL_CREDITS,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        const data = userSnap.data() || {};
+        currentCredits = typeof data.credits === "number" ? data.credits : 0;
       }
 
-      // satın alımı kaydet
+      if (purchaseSnap.exists) {
+        // daha önce işlenmiş → mevcut kredi döndür
+        return {
+          ok: true,
+          alreadyProcessed: true,
+          total: currentCredits,
+        };
+      }
+
+      // purchase kaydet
       tx.set(purchaseRef, {
         userId,
         amount: amountToAdd,
@@ -355,31 +404,29 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, async (req, res) => {
         meta: { platform, packageName, productId },
       });
 
-      // krediyi ekle
-      const userRef = db.collection("users").doc(userId);
-      const userSnap = await tx.get(userRef);
+      const newTotal = currentCredits + amountToAdd;
 
-      if (!userSnap.exists) {
-        tx.set(userRef, {
-          credits: INITIAL_CREDITS + amountToAdd,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      tx.set(
+        userRef,
+        {
+          credits: newTotal,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        return { ok: true, alreadyProcessed: false, total: INITIAL_CREDITS + amountToAdd };
-      }
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-      const current = (userSnap.data()?.credits ?? 0);
-      const newTotal = current + amountToAdd;
-
-      tx.update(userRef, {
-        credits: newTotal,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      return { ok: true, alreadyProcessed: false, total: newTotal };
+      return {
+        ok: true,
+        alreadyProcessed: false,
+        total: newTotal,
+      };
     });
 
-    console.log(`✅ add-credits user=${userId} +${amountToAdd} total=${result.total}`);
+    console.log(
+      `✅ add-credits user=${userId} +${amountToAdd} total=${result.total} alreadyProcessed=${result.alreadyProcessed}`
+    );
+
     return res.json({
       ok: true,
       alreadyProcessed: result.alreadyProcessed,
@@ -399,4 +446,6 @@ app.post("/api/cars/add-credits", requireFirebaseAuth, async (req, res) => {
 
 // -----------------------------
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Backend çalıştı: http://localhost:${port}`));
+app.listen(port, () =>
+  console.log(`Backend çalıştı: http://localhost:${port}`)
+);
